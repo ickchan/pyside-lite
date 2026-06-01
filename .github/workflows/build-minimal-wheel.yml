@@ -62,7 +62,7 @@ jobs:
           if ($modules -match 'Svg')     { $extraMods += 'qtsvg' }
           if ($modules -match 'Xml')     { $extraMods += 'qtxml' }
 
-          $cmd = "python -m aqt install-qt windows desktop ${{ inputs.qt_version }} win64_msvc2019_64 -O C:\Qt -m qtbase"
+          $cmd = "python -m aqt install-qt windows desktop ${{ inputs.qt_version }} win64_msvc2019_64 -O C:\Qt"
           if ($extraMods.Count -gt 0) {
             $cmd += " " + ($extraMods -join " ")
           }
