@@ -1,0 +1,238 @@
+# Dockerfile.windows
+# Builds a minimal PySide6 wheel for Windows using a Windows Container.
+#
+# PREREQUISITES:
+#   - Docker Desktop with Windows Containers mode enabled
+#     (Right-click Docker tray icon -> "Switch to Windows containers...")
+#   - Host Windows version must match container image (ltsc2022 = Windows 11 / Server 2022)
+#
+# USAGE:
+#   docker build -f Dockerfile.windows -t pyside6-builder .
+#   $id = docker create pyside6-builder
+#   docker cp "${id}:C:\output" .\wheel_output\
+#   docker rm $id
+#
+# Or with a volume mount:
+#   docker run --rm -v C:\my\output:C:\output pyside6-builder
+#
+# BUILD ARGS:
+#   PYSIDE_VERSION  - PySide6 version to build  (default: 6.8.3)
+#   QT_VERSION      - Qt version for aqtinstall  (default: 6.8.3)
+#   MODULE_SUBSET   - Comma-separated PySide6 modules (default: Core,Gui,Widgets)
+#   PYTHON_VERSION  - Python minor version tag for choco (default: 311 = 3.11)
+#   PARALLEL_JOBS   - Parallel compile jobs        (default: 4)
+#   ENABLE_UPX      - Set to "1" to UPX-compress *.pyd files after build (default: 0)
+#
+# RESOURCE ESTIMATES:
+#   Disk during build : ~30-40 GB
+#   Final image size  : ~15-20 GB
+#   Build time        : 3-6 hours (4-core CPU)
+#   RAM recommended   : 16+ GB
+#
+# VERSION NOTES:
+#   - Uses PySide6 6.8.x intentionally. 6.9+ bundles opengl32sw.dll (~19 MB software renderer).
+#   - Qt Clang must be the Qt-custom build (release_180-based), NOT the upstream LLVM release.
+#     The upstream release lacks CMake config files required by PySide6's build system.
+#   - UPX must NOT compress Qt6*.dll files — qwindows.dll and friends will be corrupted.
+#     Only *.pyd extension modules are safe to compress.
+
+ARG WINDOWS_VERSION=ltsc2022
+
+FROM mcr.microsoft.com/windows/servercore:${WINDOWS_VERSION}
+
+ARG PYSIDE_VERSION=6.8.3
+ARG QT_VERSION=6.8.3
+ARG MODULE_SUBSET=Core,Gui,Widgets
+ARG PYTHON_VERSION=311
+ARG PARALLEL_JOBS=4
+ARG ENABLE_UPX=0
+
+SHELL ["powershell", "-Command", "$ErrorActionPreference = 'Stop'; $ProgressPreference = 'SilentlyContinue';"]
+
+# ─── Stage 1: Chocolatey ───────────────────────────────────────────────────────
+RUN Set-ExecutionPolicy Bypass -Scope Process -Force; \
+    [System.Net.ServicePointManager]::SecurityProtocol = \
+        [System.Net.ServicePointManager]::SecurityProtocol -bor 3072; \
+    iex ((New-Object System.Net.WebClient).DownloadString( \
+        'https://community.chocolatey.org/install.ps1'))
+
+# ─── Stage 2: Core build tools ────────────────────────────────────────────────
+RUN choco install -y --no-progress git cmake ninja 7zip
+RUN choco install -y --no-progress python$env:PYTHON_VERSION
+
+# Persist refreshed PATH for subsequent RUN layers
+RUN [System.Environment]::SetEnvironmentVariable('PATH', \
+    [System.Environment]::GetEnvironmentVariable('PATH','Machine') + ';' + \
+    [System.Environment]::GetEnvironmentVariable('PATH','User'), 'Machine')
+
+# ─── Stage 3: MSVC Build Tools 2022 ───────────────────────────────────────────
+# Downloads ~3-4 GB; takes 10-20 min. Exit code 3010 = "reboot requested" (safe to ignore).
+RUN New-Item -ItemType Directory -Force C:\TEMP | Out-Null; \
+    Invoke-WebRequest -Uri 'https://aka.ms/vs/17/release/vs_buildtools.exe' \
+        -OutFile 'C:\TEMP\vs_buildtools.exe' -UseBasicParsing
+
+RUN $proc = Start-Process 'C:\TEMP\vs_buildtools.exe' -ArgumentList \
+        '--quiet', '--wait', '--norestart', '--nocache', \
+        '--installPath', 'C:\BuildTools', \
+        '--add', 'Microsoft.VisualStudio.Workload.VCTools', \
+        '--add', 'Microsoft.VisualStudio.Component.VC.Tools.x86.x64', \
+        '--add', 'Microsoft.VisualStudio.Component.Windows11SDK.22621' \
+        -Wait -PassThru; \
+    if ($proc.ExitCode -notin @(0, 3010)) { \
+        throw "vs_buildtools.exe exited with $($proc.ExitCode)" \
+    }
+
+# Add MSVC cl.exe / link.exe to PATH (version folder is dynamic, resolve at build time)
+RUN $msvcVer = (Get-ChildItem 'C:\BuildTools\VC\Tools\MSVC' | \
+        Sort-Object Name -Descending | Select-Object -First 1).Name; \
+    $msvcBin = "C:\BuildTools\VC\Tools\MSVC\$msvcVer\bin\HostX64\x64"; \
+    [System.Environment]::SetEnvironmentVariable('MSVC_BIN', $msvcBin, 'Machine'); \
+    [System.Environment]::SetEnvironmentVariable('PATH', \
+        "$msvcBin;C:\BuildTools\MSBuild\Current\Bin;" + \
+        [System.Environment]::GetEnvironmentVariable('PATH','Machine'), 'Machine')
+
+# ─── Stage 4: Qt 6.8.x via aqtinstall ─────────────────────────────────────────
+# Only qtbase is needed for Core + Gui + Widgets.
+# Add -m qtsvg qtnetwork qtxml if MODULE_SUBSET is expanded.
+RUN python -m pip install --upgrade pip
+RUN pip install aqtinstall
+
+RUN python -m aqt install-qt windows desktop $env:QT_VERSION win64_msvc2019_64 \
+        -O C:\Qt \
+        -m qtbase; \
+    if (-not (Test-Path "C:\Qt\$env:QT_VERSION\msvc2019_64\bin\qtpaths6.exe")) { \
+        throw "Qt installation failed - qtpaths6.exe not found at expected path" \
+    }; \
+    Write-Host "Qt $env:QT_VERSION installed OK"
+
+# ─── Stage 5: Qt-custom Clang/LLVM (release_180-based) ────────────────────────
+# CRITICAL: Do NOT substitute with official LLVM. The Qt build uses a patched Clang
+# with additional CMake config files. Without it, shiboken6 will not configure.
+#
+# Full URL: https://download.qt.io/development_releases/prebuilt/libclang/
+#           libclang-release_180-based-windows-vs2019_64.7z  (~300 MB)
+RUN Invoke-WebRequest \
+    -Uri 'https://download.qt.io/development_releases/prebuilt/libclang/libclang-release_180-based-windows-vs2019_64.7z' \
+    -OutFile 'C:\TEMP\libclang.7z' -UseBasicParsing
+
+RUN 7z x C:\TEMP\libclang.7z -oC:\ -y | Out-Null; \
+    if (-not (Test-Path 'C:\libclang\bin\clang.exe')) { \
+        throw "Clang extraction failed - C:\libclang\bin\clang.exe not found" \
+    }
+
+RUN [System.Environment]::SetEnvironmentVariable('LLVM_INSTALL_DIR', 'C:\libclang', 'Machine'); \
+    [System.Environment]::SetEnvironmentVariable('PATH', \
+        'C:\libclang\bin;' + \
+        [System.Environment]::GetEnvironmentVariable('PATH','Machine'), 'Machine')
+
+# ─── Stage 6: pyside-setup source ─────────────────────────────────────────────
+# Clone the exact release tag for reproducibility.
+RUN git clone --depth=1 --branch "v$env:PYSIDE_VERSION" \
+        https://github.com/qtproject/pyside-pyside-setup.git C:\pyside-setup; \
+    if ($LASTEXITCODE -ne 0) { \
+        Write-Warning "Tag v$env:PYSIDE_VERSION not found, cloning HEAD instead"; \
+        git clone --depth=1 \
+            https://github.com/qtproject/pyside-pyside-setup.git C:\pyside-setup \
+    }
+
+# ─── Stage 7: Python build dependencies ───────────────────────────────────────
+RUN pip install setuptools wheel cmake ninja packaging
+
+# ─── Stage 8: Build minimal PySide6 wheel ─────────────────────────────────────
+WORKDIR C:\pyside-setup
+
+# Run inside cmd so that vcvarsall.bat correctly initialises the MSVC environment.
+# Key flags:
+#   --module-subset      : compile only the listed binding modules
+#   --no-qt-tools        : skip designer.exe / linguist.exe / etc. (saves ~50 MB)
+#   --parallel           : number of parallel compile jobs
+#   --disable-pyi        : skip .pyi stub generation (saves ~5-10 MB in wheel)
+#   --skip-docs          : do not build Qt documentation helpers
+RUN $qtpaths = "C:\Qt\$env:QT_VERSION\msvc2019_64\bin\qtpaths6.exe"; \
+    $vcvars  = 'C:\BuildTools\VC\Auxiliary\Build\vcvarsall.bat'; \
+    $buildCmd = "python setup.py bdist_wheel" + \
+        " --qtpaths=`"$qtpaths`"" + \
+        " --module-subset=$env:MODULE_SUBSET" + \
+        " --no-qt-tools" + \
+        " --parallel=$env:PARALLEL_JOBS" + \
+        " --disable-pyi" + \
+        " --skip-docs"; \
+    Write-Host "Build command: $buildCmd"; \
+    cmd /c "`"$vcvars`" amd64 && $buildCmd"; \
+    if ($LASTEXITCODE -ne 0) { throw "PySide6 build failed" }
+
+# ─── Stage 9: Optional UPX compression of *.pyd files ─────────────────────────
+# UPX compresses Python extension modules (.pyd) but MUST NOT touch Qt6*.dll —
+# those DLLs contain Qt's internal resource system and UPX corrupts them.
+# Enable by passing --build-arg ENABLE_UPX=1 to `docker build`.
+RUN if ($env:ENABLE_UPX -eq '1') { \
+        Write-Host 'UPX: installing...'; \
+        choco install -y --no-progress upx; \
+        $pydFiles = Get-ChildItem C:\pyside-setup\dist -Recurse -Filter '*.pyd'; \
+        foreach ($f in $pydFiles) { \
+            Write-Host "UPX compressing: $($f.Name)"; \
+            upx --best --no-progress $f.FullName \
+        }; \
+        Write-Host "UPX done. $($pydFiles.Count) files compressed." \
+    } else { \
+        Write-Host 'UPX disabled (pass --build-arg ENABLE_UPX=1 to enable)' \
+    }
+
+# ─── Stage 10: Export wheel ────────────────────────────────────────────────────
+RUN New-Item -ItemType Directory -Force C:\output | Out-Null; \
+    $wheels = Get-ChildItem C:\pyside-setup\dist\*.whl; \
+    if (-not $wheels) { throw "No wheel found in C:\pyside-setup\dist\" }; \
+    $wheels | ForEach-Object { \
+        $mb = [math]::Round($_.Length / 1MB, 1); \
+        Write-Host "Built: $($_.Name) ($mb MB)"; \
+        Copy-Item $_.FullName C:\output\ \
+    }
+
+# Default entrypoint: list the output wheel(s)
+CMD ["powershell", "-Command", \
+    "Write-Host '=== Build output ==='; \
+     Get-ChildItem C:\\output\\*.whl | ForEach-Object { \
+         $mb = [math]::Round($_.Length/1MB,1); \
+         Write-Host \"  $($_.Name)  ($mb MB)\" \
+     }; \
+     Write-Host 'Use: docker cp <container>:C:\\output\\ .\\wheel_output\\'"]
+
+
+# ─── QUICK REFERENCE ──────────────────────────────────────────────────────────
+#
+# Minimal build (Core+Gui+Widgets, ~42-50 MB PyInstaller output):
+#   docker build -f Dockerfile.windows -t pyside6-builder .
+#
+# With UPX .pyd compression (~5-10% smaller):
+#   docker build -f Dockerfile.windows --build-arg ENABLE_UPX=1 -t pyside6-builder .
+#
+# Extended subset (adds Network, Svg, Xml):
+#   docker build -f Dockerfile.windows \
+#     --build-arg MODULE_SUBSET=Core,Gui,Widgets,Network,Svg,SvgWidgets,Xml \
+#     -t pyside6-builder .
+#
+# Extract wheel after build:
+#   $id = docker create pyside6-builder
+#   docker cp "${id}:C:\output" .\wheel_output\
+#   docker rm $id
+#
+# ─── TROUBLESHOOTING ──────────────────────────────────────────────────────────
+#
+# "no matching manifest for windows/amd64 in the manifest list":
+#   Docker is in Linux mode. Switch: right-click tray icon -> "Switch to Windows containers"
+#   Verify: docker info | Select-String OSType   (must show "windows")
+#
+# vcvarsall.bat not found:
+#   MSVC stage failed silently. Rebuild with --no-cache from Stage 3.
+#
+# Qt not found / qtpaths6.exe missing:
+#   aqtinstall may have used a different output path. Check: C:\Qt\6.8.3\msvc2019_64\bin\
+#
+# Clang CMake errors ("Could not find ClangConfig.cmake"):
+#   Must use Qt's custom Clang, not upstream LLVM. Re-download from download.qt.io URL above.
+#
+# shiboken6 build errors about missing Qt modules:
+#   Verify -m qtbase was installed. For Network/Svg add: -m qtbase qtsvg qtnetwork qtxml
+#
+# UPX "NotCompressible" warnings on .pyd:
+#   Normal for already-compressed or debug-stripped binaries. Not an error.

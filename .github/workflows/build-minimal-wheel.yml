@@ -1,0 +1,196 @@
+name: Build Minimal PySide6 Wheel
+
+on:
+  workflow_dispatch:
+    inputs:
+      pyside_version:
+        description: 'PySide6 version to build'
+        required: true
+        default: '6.8.3'
+      qt_version:
+        description: 'Qt version to use'
+        required: true
+        default: '6.8.3'
+      module_subset:
+        description: 'PySide6 module subset (comma-separated, e.g. Core,Gui,Widgets)'
+        required: true
+        default: 'Core,Gui,Widgets'
+      python_version:
+        description: 'Python version'
+        required: true
+        default: '3.11'
+      enable_upx:
+        description: 'Enable UPX compression of .pyd files'
+        required: false
+        type: boolean
+        default: false
+
+jobs:
+  build:
+    name: Build PySide6 minimal wheel
+    runs-on: windows-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python ${{ inputs.python_version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python_version }}
+
+      - name: Install Python dependencies
+        shell: pwsh
+        run: |
+          pip install aqtinstall setuptools wheel cmake ninja packaging
+
+      - name: Cache Qt installation
+        id: cache-qt
+        uses: actions/cache@v4
+        with:
+          path: C:\Qt
+          key: qt-windows-${{ inputs.qt_version }}-msvc2019_64
+
+      - name: Install Qt via aqtinstall
+        if: steps.cache-qt.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          $modules = "${{ inputs.module_subset }}"
+          $extraMods = @()
+          if ($modules -match 'Network') { $extraMods += 'qtnetwork' }
+          if ($modules -match 'Svg')     { $extraMods += 'qtsvg' }
+          if ($modules -match 'Xml')     { $extraMods += 'qtxml' }
+
+          $cmd = "python -m aqt install-qt windows desktop ${{ inputs.qt_version }} win64_msvc2019_64 -O C:\Qt -m qtbase"
+          if ($extraMods.Count -gt 0) {
+            $cmd += " " + ($extraMods -join " ")
+          }
+          Write-Host "Running: $cmd"
+          Invoke-Expression $cmd
+
+      - name: Cache libclang
+        id: cache-clang
+        uses: actions/cache@v4
+        with:
+          path: C:\libclang
+          key: libclang-release_180-windows-vs2019_64
+
+      - name: Download and extract libclang
+        if: steps.cache-clang.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          $url = "https://download.qt.io/development_releases/prebuilt/libclang/libclang-release_180-based-windows-vs2019_64.7z"
+          $dest = "C:\libclang.7z"
+          Write-Host "Downloading libclang from $url ..."
+          Invoke-WebRequest -Uri $url -OutFile $dest -UseBasicParsing
+          Write-Host "Extracting libclang..."
+          & "7z" x $dest -o"C:\libclang_extract" -y
+          # The archive contains a top-level 'libclang' folder
+          $inner = Get-ChildItem "C:\libclang_extract" | Select-Object -First 1
+          Move-Item $inner.FullName "C:\libclang"
+
+      - name: Set LLVM_INSTALL_DIR environment variable
+        shell: pwsh
+        run: |
+          echo "LLVM_INSTALL_DIR=C:\libclang" >> $env:GITHUB_ENV
+
+      - name: Clone pyside-setup
+        shell: pwsh
+        run: |
+          $ver = "${{ inputs.pyside_version }}"
+          $tag = "v$ver"
+          Write-Host "Cloning pyside-setup tag $tag ..."
+          $result = git clone --depth=1 --branch $tag https://github.com/qt-project/pyside-pyside-setup.git pyside-setup 2>&1
+          if ($LASTEXITCODE -ne 0) {
+            Write-Warning "Tag $tag not found, cloning default branch..."
+            git clone --depth=1 https://github.com/qt-project/pyside-pyside-setup.git pyside-setup
+          }
+
+      - name: Find vcvarsall.bat
+        id: find-vcvarsall
+        shell: pwsh
+        run: |
+          # Try vswhere first
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          if (Test-Path $vswhere) {
+            $vsPath = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+            $vcvarsall = Join-Path $vsPath "VC\Auxiliary\Build\vcvarsall.bat"
+          } else {
+            $vcvarsall = "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat"
+          }
+          if (-not (Test-Path $vcvarsall)) {
+            Write-Error "vcvarsall.bat not found at: $vcvarsall"
+            exit 1
+          }
+          Write-Host "Found vcvarsall at: $vcvarsall"
+          echo "VCVARSALL=$vcvarsall" >> $env:GITHUB_ENV
+
+      - name: Build PySide6 wheel (MSVC environment)
+        shell: cmd
+        working-directory: pyside-setup
+        run: |
+          call "%VCVARSALL%" amd64
+          if errorlevel 1 (
+            echo ERROR: vcvarsall.bat failed
+            exit /b 1
+          )
+          set LLVM_INSTALL_DIR=C:\libclang
+          python setup.py bdist_wheel ^
+            --qtpaths=C:\Qt\${{ inputs.qt_version }}\msvc2019_64\bin\qtpaths6.exe ^
+            --module-subset=${{ inputs.module_subset }} ^
+            --no-qt-tools ^
+            --parallel=4 ^
+            --disable-pyi ^
+            --skip-docs
+          if errorlevel 1 (
+            echo ERROR: build failed
+            exit /b 1
+          )
+
+      - name: Install UPX and compress .pyd files
+        if: ${{ inputs.enable_upx == true }}
+        shell: pwsh
+        run: |
+          choco install upx -y --no-progress
+          $pydFiles = Get-ChildItem -Path "pyside-setup\dist" -Filter "*.pyd" -Recurse
+          foreach ($f in $pydFiles) {
+            Write-Host "Compressing $($f.FullName)..."
+            upx --best $f.FullName
+          }
+
+      - name: Upload wheel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pyside6-minimal-wheel-${{ inputs.pyside_version }}-py${{ inputs.python_version }}
+          path: pyside-setup/dist/*.whl
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: Print build summary
+        shell: pwsh
+        run: |
+          $wheels = Get-ChildItem -Path "pyside-setup\dist" -Filter "*.whl"
+          if ($wheels.Count -eq 0) {
+            Write-Error "No wheel files found!"
+            exit 1
+          }
+          Write-Host ""
+          Write-Host "===== Build Summary ====="
+          foreach ($w in $wheels) {
+            $sizeMB = [math]::Round($w.Length / 1MB, 2)
+            Write-Host "  $($w.Name)  ($sizeMB MB)"
+          }
+          Write-Host "========================="
+
+          # Write to job summary
+          $summary = "## Minimal PySide6 Wheel Build`n`n"
+          $summary += "| File | Size |`n|------|------|`n"
+          foreach ($w in $wheels) {
+            $sizeMB = [math]::Round($w.Length / 1MB, 2)
+            $summary += "| $($w.Name) | $sizeMB MB |`n"
+          }
+          $summary += "`n- Module subset: ``${{ inputs.module_subset }}```n"
+          $summary += "- PySide6 version: ``${{ inputs.pyside_version }}```n"
+          $summary += "- Python version: ``${{ inputs.python_version }}```n"
+          $summary | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append

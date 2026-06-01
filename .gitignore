@@ -1,0 +1,11 @@
+venv_test/
+venv_minimal/
+build/
+dist/
+wheel_analysis/
+wheel_output/
+*.egg-info/
+__pycache__/
+*.pyc
+pyside-setup/
+*.whl
