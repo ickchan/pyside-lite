@@ -74,13 +74,13 @@ jobs:
         uses: actions/cache@v4
         with:
           path: C:\libclang
-          key: libclang-release_180-windows-vs2019_64
+          key: libclang-release_18.1.7-windows-vs2019_64
 
       - name: Download and extract libclang
         if: steps.cache-clang.outputs.cache-hit != 'true'
         shell: pwsh
         run: |
-          $url = "https://download.qt.io/development_releases/prebuilt/libclang/libclang-release_180-based-windows-vs2019_64.7z"
+          $url = "https://download.qt.io/development_releases/prebuilt/libclang/libclang-release_18.1.7-based-windows-vs2019_64.7z"
           $dest = "C:\libclang.7z"
           Write-Host "Downloading libclang from $url ..."
           Invoke-WebRequest -Uri $url -OutFile $dest -UseBasicParsing
@@ -101,10 +101,10 @@ jobs:
           $ver = "${{ inputs.pyside_version }}"
           $tag = "v$ver"
           Write-Host "Cloning pyside-setup tag $tag ..."
-          $result = git clone --depth=1 --branch $tag https://github.com/qt-project/pyside-pyside-setup.git pyside-setup 2>&1
+          $result = git clone --depth=1 --branch $tag https://github.com/qtproject/pyside-pyside-setup.git pyside-setup 2>&1
           if ($LASTEXITCODE -ne 0) {
             Write-Warning "Tag $tag not found, cloning default branch..."
-            git clone --depth=1 https://github.com/qt-project/pyside-pyside-setup.git pyside-setup
+            git clone --depth=1 https://github.com/qtproject/pyside-pyside-setup.git pyside-setup
           }
 
       - name: Find vcvarsall.bat
