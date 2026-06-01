@@ -43,7 +43,7 @@ jobs:
       - name: Install Python dependencies
         shell: pwsh
         run: |
-          pip install aqtinstall setuptools wheel cmake ninja packaging
+          pip install aqtinstall setuptools "wheel<0.42" cmake ninja packaging
 
       - name: Cache Qt installation
         id: cache-qt
