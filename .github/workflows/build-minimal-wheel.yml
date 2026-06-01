@@ -74,13 +74,13 @@ jobs:
         uses: actions/cache@v4
         with:
           path: C:\libclang
-          key: libclang-release_18.1.7-windows-vs2022_64
+          key: libclang-release_21.1.2-windows-vs2022_64
 
       - name: Download and extract libclang
         if: steps.cache-clang.outputs.cache-hit != 'true'
         shell: pwsh
         run: |
-          $url = "https://download.qt.io/development_releases/prebuilt/libclang/libclang-release_18.1.7-based-windows-vs2022_64.7z"
+          $url = "https://download.qt.io/development_releases/prebuilt/libclang/libclang-release_21.1.2-based-windows-vs2022_64.7z"
           $dest = "C:\libclang.7z"
           Write-Host "Downloading libclang from $url ..."
           Invoke-WebRequest -Uri $url -OutFile $dest -UseBasicParsing
