@@ -50,7 +50,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: C:\Qt
-          key: qt-windows-${{ inputs.qt_version }}-msvc2019_64
+          key: qt-windows-${{ inputs.qt_version }}-msvc2022_64
 
       - name: Install Qt via aqtinstall
         if: steps.cache-qt.outputs.cache-hit != 'true'
@@ -62,7 +62,7 @@ jobs:
           if ($modules -match 'Svg')     { $extraMods += 'qtsvg' }
           if ($modules -match 'Xml')     { $extraMods += 'qtxml' }
 
-          $cmd = "python -m aqt install-qt windows desktop ${{ inputs.qt_version }} win64_msvc2019_64 -O C:\Qt"
+          $cmd = "python -m aqt install-qt windows desktop ${{ inputs.qt_version }} win64_msvc2022_64 -O C:\Qt"
           if ($extraMods.Count -gt 0) {
             $cmd += " " + ($extraMods -join " ")
           }
@@ -74,13 +74,13 @@ jobs:
         uses: actions/cache@v4
         with:
           path: C:\libclang
-          key: libclang-release_18.1.7-windows-vs2019_64
+          key: libclang-release_18.1.7-windows-vs2022_64
 
       - name: Download and extract libclang
         if: steps.cache-clang.outputs.cache-hit != 'true'
         shell: pwsh
         run: |
-          $url = "https://download.qt.io/development_releases/prebuilt/libclang/libclang-release_18.1.7-based-windows-vs2019_64.7z"
+          $url = "https://download.qt.io/development_releases/prebuilt/libclang/libclang-release_18.1.7-based-windows-vs2022_64.7z"
           $dest = "C:\libclang.7z"
           Write-Host "Downloading libclang from $url ..."
           Invoke-WebRequest -Uri $url -OutFile $dest -UseBasicParsing
@@ -137,12 +137,10 @@ jobs:
           )
           set LLVM_INSTALL_DIR=C:\libclang
           python setup.py bdist_wheel ^
-            --qtpaths=C:\Qt\${{ inputs.qt_version }}\msvc2019_64\bin\qtpaths6.exe ^
+            --qtpaths=C:\Qt\${{ inputs.qt_version }}\msvc2022_64\bin\qtpaths6.exe ^
             --module-subset=${{ inputs.module_subset }} ^
             --no-qt-tools ^
-            --parallel=4 ^
-            --disable-pyi ^
-            --skip-docs
+            --parallel=4
           if errorlevel 1 (
             echo ERROR: build failed
             exit /b 1
